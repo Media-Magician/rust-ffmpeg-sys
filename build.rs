@@ -801,15 +801,13 @@ fn check_features(
     .expect("Write failed");
 
     let executable = out_dir.join(if cfg!(windows) { "check.exe" } else { "check" });
-    let mut compiler = cc::Build::new()
-        .target(&env::var("HOST").unwrap()) // don't cross-compile this
-        .get_compiler()
-        .to_command();
+    let mut compiler = std::process::Command::new(if cfg!(target_os = "macos") { "clang" } else { "gcc" });
 
-    for dir in include_paths {
+    for dir in include_paths.clone() {
         compiler.arg("-I");
         compiler.arg(dir.to_string_lossy().into_owned());
     }
+
     if !compiler
         .current_dir(&out_dir)
         .arg("-o")
@@ -819,9 +817,10 @@ fn check_features(
         .expect("Command failed")
         .success()
     {
-        panic!("Compile failed");
+        panic!("Compile failed;\nout_dir: {:?};\nexecutable {:?};\n\ncommand:\n{:?}\n\ninclude: {:?}", out_dir.to_str(), executable.to_str(), compiler, include_paths);
     }
 
+    println!("Checking output:\n{};\n{}", executable.display(), out_dir.display());
     let check_output = Command::new(out_dir.join(&executable))
         .current_dir(&out_dir)
         .output()
@@ -1565,6 +1564,58 @@ fn main() {
 
     if let Some(sysroot) = sysroot.as_deref() {
         builder = builder.clang_arg(format!("--sysroot={sysroot}"));
+    }
+
+ // Android-specific bindgen configuration
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+        
+        // Set the target triple for bindgen
+        let target_triple = match target_arch.as_str() {
+            "aarch64" => "aarch64-linux-android",
+            "arm" => "armv7-linux-androideabi",
+            "x86_64" => "x86_64-linux-android",
+            "x86" => "i686-linux-android",
+            _ => panic!("Unsupported Android architecture: {}", target_arch),
+        };
+        
+        let android_api = "24"; // Or get from environment
+        
+        println!("cargo:warning=Configuring bindgen for Android target: {}{}", target_triple, android_api);
+        
+        builder = builder
+            .clang_arg(format!("--target={}{}", target_triple, android_api))
+            // Prevent bindgen from using host system headers
+            .clang_arg("-nostdinc")
+            // .clang_arg("-nobuiltininc")
+            .clang_arg("-nostdinc++");
+        
+        // Find and add clang's builtin include directory
+        // This contains stddef.h, stdint.h, etc.
+        let cc_path = env::var("CC").expect("Please set the CC environment variable.");
+
+        // Add Android sysroot includes
+        if let Ok(ndk_sysroot) = env::var("CARGO_NDK_SYSROOT_PATH") {
+            println!("cargo:warning=Using Android sysroot for bindgen: {}", ndk_sysroot);
+            
+            builder = builder
+                .clang_arg(format!("-isystem{}/usr/include", ndk_sysroot))
+                .clang_arg(format!("-isystem{}/usr/include/{}", ndk_sysroot, target_triple));
+        }
+        
+        // Get clang's resource directory
+        if let Ok(output) = std::process::Command::new(&cc_path)
+            .arg("-print-resource-dir")
+            .output()
+        {
+            let resource_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let builtin_includes = format!("{}/include", resource_dir);
+            
+            if std::path::Path::new(&builtin_includes).exists() {
+                println!("cargo:warning=Adding clang builtin includes: {}", builtin_includes);
+                builder = builder.clang_arg(format!("-isystem{}", builtin_includes));
+            }
+        }
     }
 
     // The input headers we would like to generate
